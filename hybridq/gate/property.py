@@ -317,6 +317,9 @@ class PowerMatrixGate(PowerGate, __Base__):
         else:
             return super().__eq__(other)
 
+    def __hash__(self) -> int:
+        return super().__hash__()
+
     def __print__(self):
         return {
             'ct': (0, '^+' if self.__conj and self.__T else
@@ -817,17 +820,23 @@ def _s_transform(s):
 
     # If diagonal, just return the diagonal
     elif s.ndim == 2:
-        return _s_transform(np.diag(s)) if np.allclose(s, np.diag(
-            np.diag(s))) else s
+        # Return
+        return _s_transform(
+            np.diag(s)) if s.shape[0] == s.shape[1] and np.allclose(
+                s, np.diag(np.diag(s))) else s
 
     # Raise an implementation error
     else:
         raise NotImplementedError
 
 
-@compare('gates,s')
-@staticvars('gates,s',
-            transform=dict(gates=_gate_transform, s=_s_transform),
+@compare('gates,s,_conj_rgates')
+@staticvars('gates,s,_conj_rgates,_use_cache',
+            _conj_rgates=False,
+            _use_cache=True,
+            transform=dict(gates=_gate_transform,
+                           s=_s_transform,
+                           _use_cache=lambda x: bool(x)),
             check=dict(s=(lambda s: s is None or 0 <= s.ndim <= 2,
                           "'s' cannot have more than two dimensions.")))
 class SchmidtGate(__Base__):
@@ -846,7 +855,8 @@ class SchmidtGate(__Base__):
 
         # If s is scalar, skip control
         if s.ndim == 0:
-            pass
+            if nr != nl:
+                _err = True
 
         # s is a vector
         elif s.ndim == 1:
@@ -881,6 +891,16 @@ class SchmidtGate(__Base__):
                 0)
         }
 
+    def __reduce__(self,
+                   *,
+                   ignore_sdict: tuple[str, ...] = tuple(),
+                   ignore_methods: tuple[str, ...] = tuple(),
+                   ignore_keys: tuple[str, ...] = tuple()):
+        return super().__reduce__(ignore_sdict=ignore_sdict,
+                                  ignore_methods=ignore_methods,
+                                  ignore_keys=ignore_keys +
+                                  ('_cached_hash', '_cached_Matrix'))
+
     @property
     def Matrix(self):
         """
@@ -890,6 +910,21 @@ class SchmidtGate(__Base__):
         from hybridq.gate import TupleGate, MatrixGate, NamedGate
         from hybridq.utils import sort
 
+        # Check if a cached value is already present. If yes, return it
+        if self._use_cache:
+            # Get cached hash
+            cached_hash = getattr(self, '_cached_hash', None)
+
+            # Get cached Matrix
+            cached_Matrix = getattr(self, '_cached_Matrix', None)
+
+            # Compute new hash
+            new_hash = hash(self)
+
+            # Return cached matrix
+            if new_hash == cached_hash and cached_Matrix is not None:
+                return cached_Matrix
+
         # Get left and right gates
         l_gates, r_gates = self.gates
 
@@ -897,7 +932,8 @@ class SchmidtGate(__Base__):
         l_gates = TupleGate(
             MatrixGate(U=g.matrix(), qubits=g.qubits) for g in l_gates)
         r_gates = TupleGate(
-            MatrixGate(U=g.matrix(), qubits=g.qubits) for g in r_gates)
+            MatrixGate(U=(g.conj() if self._conj_rgates else g).matrix(),
+                       qubits=g.qubits) for g in r_gates)
 
         # Get left and right qubits
         l_qubits, r_qubits = l_gates.qubits, r_gates.qubits
@@ -941,33 +977,54 @@ class SchmidtGate(__Base__):
         # Get \sum_i X_i L_i R_i
         if s.ndim == 0:
             # Return Matrix
-            return np.sum(
+            Matrix = np.sum(
                 [_merge(l_g, r_g, s) for l_g, r_g in zip(l_gates, r_gates)],
                 axis=0)
 
         elif s.ndim == 1:
             # Return Matrix
-            return np.sum([
-                _merge(l_g, r_g, c) for c, l_g, r_g in zip(s, l_gates, r_gates)
+            Matrix = np.sum([
+                _merge(l_g, r_g, s)
+                for s, l_g, r_g in zip(s, l_gates, r_gates)
+                if not np.isclose(s, 0)
             ],
-                          axis=0)
+                            axis=0)
 
         # Get \sum_ij s_ij L_i R_j
         elif s.ndim == 2:
+            from scipy.sparse import csr_matrix
+
+            # Convert to sparse matrix
+            s = csr_matrix(s)
+
             # Return Matrix
-            return np.sum([
+            Matrix = np.sum([
                 _merge(l_gates[i], r_gates[j], s[i, j])
-                for i in range(len(s))
-                for j in range(len(s))
+                for i, j in zip(*s.nonzero())
+                if not np.isclose(s[i, j], 0)
             ],
-                          axis=0)
+                            axis=0)
 
         else:
             raise NotImplementedError
 
+        # Save cache
+        if self._use_cache:
+            # Cache hash
+            self._cached_hash = new_hash
+
+            # Cache Matrix
+            self._cached_Matrix = Matrix
+
+        # Return Matrix
+        return Matrix
+
 
 @requires('sample')
-@staticvars('gates', transform=dict(gates=lambda gates: BaseTupleGate(gates)))
+@staticvars(
+    'gates',
+    transform=dict(
+        gates=lambda gates: None if gates is None else BaseTupleGate(gates)))
 class StochasticGate(__Base__):
     pass
 
